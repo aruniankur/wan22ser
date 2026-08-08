@@ -396,6 +396,28 @@ def get_num_frames(duration_seconds: float):
     return ((raw - 1) // 4) * 4 + 1
 
 
+def clamp_dim(value: int) -> int:
+    value = round(value / MULTIPLE_OF) * MULTIPLE_OF
+    return max(MIN_DIM, min(MAX_DIM, value))
+
+
+def on_image_upload(image, user_override):
+    if image is None:
+        return gr.update(), gr.update(), "", user_override
+    width, height = image.size
+    auto_w, auto_h = clamp_dim(width), clamp_dim(height)
+    size_text = f"**Image size:** {width} × {height} px"
+    if (auto_w, auto_h) != (width, height):
+        size_text += f"  →  Output: {auto_w} × {auto_h} px"
+    if user_override:
+        return gr.update(), gr.update(), size_text, user_override
+    return auto_w, auto_h, size_text, False
+
+
+def mark_user_override():
+    return True
+
+
 def run_inference(
     resized_image,
     processed_last_image,
@@ -631,6 +653,8 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
     with gr.Row():
         with gr.Column():
             input_image_component = gr.Image(type="pil", label="Input Image", sources=["upload", "clipboard"])
+            image_size_info = gr.Markdown("")
+            user_override_state = gr.State(False)
             prompt_input = gr.Textbox(label="Prompt", value=default_prompt_i2v)
             duration_seconds_input = gr.Slider(minimum=MIN_DURATION, maximum=MAX_DURATION, step=0.1, value=3.5, label="Duration (seconds)", info=f"Clamped to model's {MIN_FRAMES_MODEL}-{MAX_FRAMES_MODEL} frames at {FIXED_FPS}fps.")
             frame_multi = gr.Dropdown(
@@ -696,6 +720,14 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
         inputs=ui_inputs, 
         outputs=[video_output, file_output, seed_input]
     )
+
+    input_image_component.change(
+        fn=on_image_upload,
+        inputs=[input_image_component, user_override_state],
+        outputs=[width_input, height_input, image_size_info, user_override_state],
+    )
+    width_input.change(fn=mark_user_override, outputs=[user_override_state])
+    height_input.change(fn=mark_user_override, outputs=[user_override_state])
     
     # --- Frame Grabbing Events ---
     # 1. Click button -> JS runs -> puts time in hidden number box
