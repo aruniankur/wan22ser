@@ -1,8 +1,4 @@
-import os; os.system('pip install --upgrade --no-deps spaces')
-import spaces
-import shutil
-import subprocess
-import sys
+import os
 import copy
 import random
 import tempfile
@@ -32,16 +28,10 @@ from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
 from diffusers.utils.export_utils import export_to_video
 
 from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig, Int8WeightOnlyConfig
-import aoti
 import lora_loader
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 warnings.filterwarnings("ignore")
-IS_ZERO_GPU = bool(os.getenv("SPACES_ZERO_GPU"))
-
-# if IS_ZERO_GPU:
-#     print("Loading...")
-#     subprocess.run("rm -rf /data-nvme/zerogpu-offload/*", env={}, shell=True)
 
 # --- FRAME EXTRACTION JS & LOGIC ---
 
@@ -106,12 +96,15 @@ def clear_vram():
 # RIFE
 if not os.path.exists("RIFEv4.26_0921.zip"):
     print("Downloading RIFE Model...")
-    subprocess.run([
-        "wget", "-q",
+    import urllib.request
+    urllib.request.urlretrieve(
         "https://huggingface.co/thornmaze/RIFE/resolve/main/RIFEv4.26_0921.zip",
-        "-O", "RIFEv4.26_0921.zip"
-    ], check=True)
-    subprocess.run(["unzip", "-o", "RIFEv4.26_0921.zip"], check=True)
+        "RIFEv4.26_0921.zip"
+    )
+    import zipfile
+    with zipfile.ZipFile("RIFEv4.26_0921.zip") as z:
+        z.extractall(".")
+    print("RIFE Model extracted.")
 
 # sys.path.append(os.getcwd())
 
@@ -310,15 +303,6 @@ torch._dynamo.reset()
 quantize_(pipe.transformer_2, Float8DynamicActivationFloat8WeightConfig())
 torch._dynamo.reset()
 
-spaces.aoti_load(
-    module=pipe.transformer,
-    repo_id='thornmaze/WanTransformer3DModel-sm120-cu130-raa',
-)
-spaces.aoti_load(
-    module=pipe.transformer_2,
-    repo_id='thornmaze/WanTransformer3DModel-sm120-cu130-raa',
-)
-
 # pipe.vae.enable_slicing()
 # pipe.vae.enable_tiling()
 
@@ -381,49 +365,6 @@ def get_num_frames(duration_seconds: float):
     return ((raw - 1) // 4) * 4 + 1
 
 
-def get_inference_duration(
-    resized_image,
-    processed_last_image,
-    prompt,
-    steps,
-    negative_prompt,
-    num_frames,
-    guidance_scale,
-    guidance_scale_2,
-    current_seed,
-    scheduler_name,
-    flow_shift,
-    frame_multiplier,
-    quality,
-    duration_seconds,
-    safe_mode,
-    lora_groups,
-    progress
-):
-    BASE_FRAMES_HEIGHT_WIDTH = 81 * 832 * 624
-    BASE_STEP_DURATION = 5.
-    width, height = resized_image.size
-    factor = num_frames * width * height / BASE_FRAMES_HEIGHT_WIDTH
-    step_duration = BASE_STEP_DURATION * factor ** 1.5
-    gen_time = int(steps) * step_duration
-
-    if guidance_scale > 1:
-        gen_time = gen_time * 2.4
-
-    frame_factor = frame_multiplier // FIXED_FPS
-    if frame_factor > 1:
-        total_out_frames = (num_frames * frame_factor) - num_frames
-        inter_time = (total_out_frames * 0.02)
-        gen_time += inter_time
-
-    total_time = 15 + gen_time
-    if safe_mode:
-        total_time = total_time * 1.30
-
-    return total_time
-
-
-@spaces.GPU(duration=get_inference_duration, size='xlarge')
 def run_inference(
     resized_image,
     processed_last_image,
@@ -579,7 +520,7 @@ def generate_video(
     Note:
         - Frame count is calculated as duration_seconds * FIXED_FPS (24)
         - Output dimensions are adjusted to be multiples of MOD_VALUE (32)
-        - The function uses GPU acceleration via the @spaces.GPU decorator
+        - The function uses GPU acceleration for inference
         - Generation time varies based on steps and duration (see get_duration function)
     """
     
@@ -719,7 +660,7 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
 
 if __name__ == "__main__":
     demo.queue().launch(
-        mcp_server=True,
+        server_name="0.0.0.0",
         css=CSS,
         show_error=True,
     )

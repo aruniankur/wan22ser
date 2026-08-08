@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Hugging Face cache / downloaded models
+.cache/
+hf_cache/
+huggingface_cache/
+
+# Downloaded at runtime (RIFE)
+RIFEv4.26_0921.zip
+train_log/
+*.pkl
+
+# Generated videos / outputs
+*.mp4
+*.webm
+*.mov
+*.avi
+outputs/
+generated/
+results/
+
+# Gradio / temp
+/tmp/
+gradio_cached_examples/
+gradio_cached_files/
+
+# Torch / compile caches
+torchinductor_*/
+.profiling/
+*.aototrace
+
+# Logs
+*.log
