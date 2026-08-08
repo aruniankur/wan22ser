@@ -27,7 +27,7 @@ from diffusers import (
 from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
 from diffusers.utils.export_utils import export_to_video
 
-from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig, Int8WeightOnlyConfig
+from torchao.quantization import quantize_, Int8WeightOnlyConfig
 import lora_loader
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -257,19 +257,16 @@ pipe = WanImageToVideoPipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
 )
 
-pipe.text_encoder = pipe.text_encoder.to('cuda')
 quantize_(pipe.text_encoder, Int8WeightOnlyConfig())
 torch._dynamo.reset()
 
-pipe.transformer = pipe.transformer.to('cuda')
-quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig())
+quantize_(pipe.transformer, Int8WeightOnlyConfig())
 torch._dynamo.reset()
 
-pipe.transformer_2 = pipe.transformer_2.to('cuda')
-quantize_(pipe.transformer_2, Float8DynamicActivationFloat8WeightConfig())
+quantize_(pipe.transformer_2, Int8WeightOnlyConfig())
 torch._dynamo.reset()
 
-pipe.vae = pipe.vae.to('cuda')
+pipe = pipe.to('cuda')
 
 pipe.vae.enable_slicing()
 pipe.vae.enable_tiling()
