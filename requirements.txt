@@ -1,0 +1,19 @@
+diffusers==0.38.0
+transformers==4.57.6
+accelerate===1.13.0
+safetensors
+sentencepiece
+peft==0.19.1
+ftfy
+imageio
+imageio-ffmpeg
+opencv-python
+torchao==0.17.0
+
+numpy>=1.16, <=1.23.5
+# tqdm>=4.35.0
+# sk-video>=1.1.10
+# opencv-python>=4.1.2
+# moviepy>=1.0.3
+torch==2.11.0
+torchvision==0.26.0
