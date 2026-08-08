@@ -263,8 +263,9 @@ LORA_MODELS = []
 
 MAX_DIM = 832
 MIN_DIM = 480
-SQUARE_DIM = 640
 MULTIPLE_OF = 16
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 640
 MAX_SEED = np.iinfo(np.int32).max
 
 FIXED_FPS = 16
@@ -370,39 +371,13 @@ def model_title():
     return "## Wan 2.2 I2V 14B Lightning — NSFW"
 
 
-def resize_image(image: Image.Image) -> Image.Image:
-    width, height = image.size
-    if width == height:
-        return image.resize((SQUARE_DIM, SQUARE_DIM), Image.LANCZOS)
-    
-    aspect_ratio = width / height
-    MAX_ASPECT_RATIO = MAX_DIM / MIN_DIM
-    MIN_ASPECT_RATIO = MIN_DIM / MAX_DIM
-
-    image_to_resize = image
-    if aspect_ratio > MAX_ASPECT_RATIO:
-        target_w, target_h = MAX_DIM, MIN_DIM
-        crop_width = int(round(height * MAX_ASPECT_RATIO))
-        left = (width - crop_width) // 2
-        image_to_resize = image.crop((left, 0, left + crop_width, height))
-    elif aspect_ratio < MIN_ASPECT_RATIO:
-        target_w, target_h = MIN_DIM, MAX_DIM
-        crop_height = int(round(width / MIN_ASPECT_RATIO))
-        top = (height - crop_height) // 2
-        image_to_resize = image.crop((0, top, width, top + crop_height))
-    else:
-        if width > height:
-            target_w = MAX_DIM
-            target_h = int(round(target_w / aspect_ratio))
-        else:
-            target_h = MAX_DIM
-            target_w = int(round(target_h * aspect_ratio))
-
-    final_w = round(target_w / MULTIPLE_OF) * MULTIPLE_OF
-    final_h = round(target_h / MULTIPLE_OF) * MULTIPLE_OF
-    final_w = max(MIN_DIM, min(MAX_DIM, final_w))
-    final_h = max(MIN_DIM, min(MAX_DIM, final_h))
-    return image_to_resize.resize((final_w, final_h), Image.LANCZOS)
+def resize_image(image: Image.Image, width: int, height: int) -> Image.Image:
+    target_width, target_height = image.size
+    scale = max(width / target_width, height / target_height)
+    new_width, new_height = int(target_width * scale), int(target_height * scale)
+    resized = image.resize((new_width, new_height), Image.LANCZOS)
+    left, top = (new_width - width) // 2, (new_height - height) // 2
+    return resized.crop((left, top, left + width, top + height))
 
 
 def resize_and_crop_to_match(target_image, reference_image):
@@ -546,6 +521,8 @@ def generate_video(
     frame_multiplier=16,
     safe_mode=False,
     lora_groups=None,
+    width=DEFAULT_WIDTH,
+    height=DEFAULT_HEIGHT,
     video_component=True,
     progress=gr.Progress(track_tqdm=True),
 ):
@@ -577,6 +554,10 @@ def generate_video(
         scheduler (str, optional): The name of the scheduler to use for inference. Defaults to "UniPCMultistep".
         flow_shift (float, optional): The flow shift value for compatible schedulers. Defaults to 6.0.
         frame_multiplier (int, optional): The int value for fps enhancer
+        width (int, optional): Output width in pixels. Must be a multiple of MULTIPLE_OF (16).
+            Defaults to DEFAULT_WIDTH (640).
+        height (int, optional): Output height in pixels. Must be a multiple of MULTIPLE_OF (16).
+            Defaults to DEFAULT_HEIGHT (640).
         video_component(bool, optional): Show video player in output.
             Defaults to True.
         progress (gr.Progress, optional): Gradio progress tracker. Defaults to gr.Progress(track_tqdm=True).
@@ -599,7 +580,7 @@ def generate_video(
 
     num_frames = get_num_frames(duration_seconds)
     current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
-    resized_image = resize_image(input_image)
+    resized_image = resize_image(input_image, int(width), int(height))
 
     processed_last_image = None
     if last_image:
@@ -679,6 +660,9 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
                     info="Select a custom scheduler."
                 )
                 flow_shift_slider = gr.Slider(minimum=0.5, maximum=15.0, step=0.1, value=3.0, label="Flow Shift")
+                with gr.Row():
+                    width_input = gr.Slider(minimum=MIN_DIM, maximum=MAX_DIM, step=MULTIPLE_OF, value=DEFAULT_WIDTH, label="Output Width (px)", info="Steps of 16. Image is cover-cropped to fit.")
+                    height_input = gr.Slider(minimum=MIN_DIM, maximum=MAX_DIM, step=MULTIPLE_OF, value=DEFAULT_HEIGHT, label="Output Height (px)", info="Higher values use much more VRAM/time — lower if you hit OOM.")
                 lora_dropdown = gr.Dropdown(choices=lora_loader.get_lora_choices(), label="LoRA (NSFW)", multiselect=True, info="Select scenario LoRAs")
                 play_result_video = gr.Checkbox(label="Display result", value=True, interactive=True)
 
@@ -703,6 +687,7 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
         quality_slider, scheduler_dropdown, flow_shift_slider, frame_multi,
         safe_mode_checkbox,
         lora_dropdown,
+        width_input, height_input,
         play_result_video
     ]
     
