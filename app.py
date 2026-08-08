@@ -255,7 +255,25 @@ SCHEDULER_MAP = {
 pipe = WanImageToVideoPipeline.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
-).to('cuda')
+)
+
+pipe.text_encoder = pipe.text_encoder.to('cuda')
+quantize_(pipe.text_encoder, Int8WeightOnlyConfig())
+torch._dynamo.reset()
+
+pipe.transformer = pipe.transformer.to('cuda')
+quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig())
+torch._dynamo.reset()
+
+pipe.transformer_2 = pipe.transformer_2.to('cuda')
+quantize_(pipe.transformer_2, Float8DynamicActivationFloat8WeightConfig())
+torch._dynamo.reset()
+
+pipe.vae = pipe.vae.to('cuda')
+
+pipe.vae.enable_slicing()
+pipe.vae.enable_tiling()
+
 original_scheduler = copy.deepcopy(pipe.scheduler)
 
 for i, lora in enumerate(LORA_MODELS):
@@ -295,16 +313,6 @@ for i, lora in enumerate(LORA_MODELS):
 #     print("Deleted Hugging Face cache.")
 # else:
 #     print("No hub cache found.")
-
-quantize_(pipe.text_encoder, Int8WeightOnlyConfig())
-torch._dynamo.reset()
-quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig())
-torch._dynamo.reset()
-quantize_(pipe.transformer_2, Float8DynamicActivationFloat8WeightConfig())
-torch._dynamo.reset()
-
-# pipe.vae.enable_slicing()
-# pipe.vae.enable_tiling()
 
 default_prompt_i2v = "make this image come alive, cinematic motion, smooth animation"
 default_negative_prompt = "色调艳丽, 过曝, 静态, 细节模糊不清, 字幕, 风格, 作品, 画作, 画面, 静止, 整体发灰, 最差质量, 低质量, JPEG压缩残留, 丑陋的, 残缺的, 多余的手指, 画得不好的手部, 画得不好的脸部, 畸形的, 毁容的, 形态畸形的肢体, 手指融合, 静止不动的画面, 杂乱的背景, 三条腿, 背景人很多, 倒着走"
@@ -410,20 +418,30 @@ def run_inference(
         except Exception as e:
             print(f"LoRA warning: {e}")
 
-    result = pipe(
-        image=resized_image,
-        last_image=processed_last_image,
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        height=resized_image.height,
-        width=resized_image.width,
-        num_frames=num_frames,
-        guidance_scale=float(guidance_scale),
-        guidance_scale_2=float(guidance_scale_2),
-        num_inference_steps=int(steps),
-        generator=torch.Generator(device="cuda").manual_seed(current_seed),
-        output_type="np"
-    )
+    try:
+        result = pipe(
+            image=resized_image,
+            last_image=processed_last_image,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=resized_image.height,
+            width=resized_image.width,
+            num_frames=num_frames,
+            guidance_scale=float(guidance_scale),
+            guidance_scale_2=float(guidance_scale_2),
+            num_inference_steps=int(steps),
+            generator=torch.Generator(device="cuda").manual_seed(current_seed),
+            output_type="np"
+        )
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"CUDA OOM: {e}")
+        if lora_loaded:
+            lora_loader.unload_lora(pipe)
+        pipe.scheduler = original_scheduler
+        clear_vram()
+        raise gr.Error(
+            "Out of GPU memory. Lower the duration/resolution or set both guidance scales to 1.0, then retry."
+        )
 
     if lora_loaded:
         lora_loader.unload_lora(pipe)
