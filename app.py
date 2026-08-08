@@ -33,6 +33,13 @@ import lora_loader
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 warnings.filterwarnings("ignore")
 
+print(f"[DEBUG] torch={torch.__version__} cuda_available={torch.cuda.is_available()}", flush=True)
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    print(f"[DEBUG] GPU: {torch.cuda.get_device_name(0)} | VRAM total={props.total_memory / 2**30:.1f} GiB", flush=True)
+else:
+    print("[DEBUG] CUDA NOT AVAILABLE - will fall back to CPU (very slow / may fail)", flush=True)
+
 # --- FRAME EXTRACTION JS & LOGIC ---
 
 # JS to grab timestamp from the output video
@@ -93,6 +100,29 @@ def clear_vram():
     torch.cuda.empty_cache()
 
 
+def gpu_mem_gib():
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30
+    return 0.0, 0.0
+
+
+def ram_mem_gib():
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 2**30
+    except Exception:
+        return 0.0
+
+
+def dbg(label, t0=None):
+    alloc, reserved = gpu_mem_gib()
+    elapsed = f" (+{time.time() - t0:.1f}s)" if t0 else ""
+    print(
+        f"[DEBUG] {label}{elapsed} | GPU alloc={alloc:.2f} GiB reserved={reserved:.2f} GiB | RAM={ram_mem_gib():.2f} GiB",
+        flush=True,
+    )
+
+
 # RIFE
 if not os.path.exists("RIFEv4.26_0921.zip"):
     print("Downloading RIFE Model...")
@@ -110,9 +140,11 @@ if not os.path.exists("RIFEv4.26_0921.zip"):
 
 from train_log.RIFE_HDv3 import Model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[DEBUG] RIFE device: {device}", flush=True)
 rife_model = Model()
 rife_model.load_model("train_log", -1)
 rife_model.eval()
+dbg("RIFE model loaded")
 
 
 @torch.no_grad()
@@ -252,26 +284,45 @@ SCHEDULER_MAP = {
     "DPMSolverSinglestep": DPMSolverSinglestepScheduler,
 }
 
+print(f"[DEBUG] Loading pipeline {MODEL_ID} (bf16, CPU)...", flush=True)
+t0 = time.time()
 pipe = WanImageToVideoPipeline.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
 )
+dbg("pipeline loaded", t0)
 
+for name in ["text_encoder", "transformer", "transformer_2", "vae"]:
+    comp = getattr(pipe, name, None)
+    if comp is not None:
+        nparams = sum(p.numel() for p in comp.parameters())
+        print(f"[DEBUG] component {name}: params={nparams / 1e9:.2f}B device={next(comp.parameters()).device}", flush=True)
+
+t1 = time.time()
 quantize_(pipe.text_encoder, Int8WeightOnlyConfig())
 torch._dynamo.reset()
+dbg("text_encoder quantized (int8)", t1)
 
+t1 = time.time()
 quantize_(pipe.transformer, Int8WeightOnlyConfig())
 torch._dynamo.reset()
+dbg("transformer quantized (int8)", t1)
 
+t1 = time.time()
 quantize_(pipe.transformer_2, Int8WeightOnlyConfig())
 torch._dynamo.reset()
+dbg("transformer_2 quantized (int8)", t1)
 
+t1 = time.time()
 pipe = pipe.to('cuda')
+dbg("pipeline moved to CUDA", t1)
 
 pipe.vae.enable_slicing()
 pipe.vae.enable_tiling()
+dbg("VAE tiling/slicing enabled")
 
 original_scheduler = copy.deepcopy(pipe.scheduler)
+dbg("model load complete")
 
 for i, lora in enumerate(LORA_MODELS):
     name_high_tr = lora["high_tr"].split(".")[0].split("/")[-1] + "Hh"
@@ -402,6 +453,7 @@ def run_inference(
 
     task_name = str(uuid.uuid4())[:8]
     print(f"Generating {num_frames} frames, task: {task_name}, {duration_seconds}, {resized_image.size}, lora={lora_groups}")
+    dbg(f"run_inference start (steps={steps}, guidance={guidance_scale}/{guidance_scale_2}, frames={num_frames}, scheduler={scheduler_name})")
     start = time.time()
 
     lora_loaded = False
@@ -432,10 +484,12 @@ def run_inference(
         )
     except torch.cuda.OutOfMemoryError as e:
         print(f"CUDA OOM: {e}")
+        dbg("OOM caught - GPU state before cleanup")
         if lora_loaded:
             lora_loader.unload_lora(pipe)
         pipe.scheduler = original_scheduler
         clear_vram()
+        dbg("OOM cleanup done")
         raise gr.Error(
             "Out of GPU memory. Lower the duration/resolution or set both guidance scales to 1.0, then retry."
         )
@@ -443,6 +497,7 @@ def run_inference(
     if lora_loaded:
         lora_loader.unload_lora(pipe)
 
+    dbg("inference finished")
     print("gen time passed:", time.time() - start)
 
     raw_frames_np = result.frames[0]  # Returns (T, H, W, C) float32
