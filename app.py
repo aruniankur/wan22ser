@@ -314,8 +314,8 @@ torch._dynamo.reset()
 dbg("transformer_2 quantized (int8)", t1)
 
 t1 = time.time()
-pipe = pipe.to('cuda')
-dbg("pipeline moved to CUDA", t1)
+pipe.enable_model_cpu_offload()
+dbg("model CPU offload enabled (components stream to GPU per phase)", t1)
 
 pipe.vae.enable_slicing()
 pipe.vae.enable_tiling()
