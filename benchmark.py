@@ -11,22 +11,27 @@ DEV = "cuda" if torch.cuda.is_available() else "cpu"
 if DEV == "cpu":
     raise SystemExit("CUDA not available - this benchmark requires an NVIDIA GPU")
 
-# (label, M, K, N)  M = sequence tokens, K/N = linear dims
-# Wan 2.2: hidden=5120, FFN=20480, tokens at 896x896/105f = 338688
+# Wan 2.2 14B geometry: hidden=5120, ffn=13824, heads=40, layers=40, patch=(1,2,2)
+# tokens after VAE(4x temporal, 8x spatial) + patch(2x spatial)
+#  640x640@105f -> 27*40*40 = 43,200
+#  896x896@105f -> 27*56*56 = 84,672
+# 1024x1024@105f -> 27*64*64 = 110,592
 MATMUL_SIZES = [
     ("attn-4K",    4096,   5120,  5120),
     ("attn-16K",   16384,  5120,  5120),
-    ("attn-90K",   90112,  5120,  5120),
-    ("attn-339K",  338688, 5120,  5120),
-    ("attn-442K",  442368, 5120,  5120),
-    ("mlp-339K",   338688, 5120,  20480),
+    ("attn-43K-640", 43200, 5120, 5120),
+    ("attn-85K-896", 84672, 5120, 5120),
+    ("attn-111K-1024", 110592, 5120, 5120),
+    ("ffn-85K-896", 84672, 5120, 13824),
 ]
 
 WAN_PARAMS = 14.29e9
-TOKENS = {
-    "640^2@105f": 172800,
-    "896^2@105f": 338688,
-    "1024^2@105f": 442368,
+WAN_LAYERS = 40
+WAN_HEAD_DIM = 5120
+PATCHED_TOKENS = {
+    "640^2@105f": 43200,
+    "896^2@105f": 84672,
+    "1024^2@105f": 110592,
 }
 
 
@@ -75,6 +80,7 @@ def report_system():
     print("torch     :", torch.__version__)
     print("flash-sdp :", torch.backends.cuda.flash_sdp_enabled())
     print("mem_eff   :", torch.backends.cuda.mem_efficient_sdp_enabled())
+    print("cudnn-sdp :", torch.backends.cuda.cudnn_sdp_enabled() if hasattr(torch.backends.cuda, "cudnn_sdp_enabled") else "n/a")
     print("math-sdp  :", torch.backends.cuda.math_sdp_enabled())
     print("triton    :", "PRESENT" if importlib.util.find_spec("triton") else "NOT FOUND -> torchao falls back to non-triton kernels")
     try:
@@ -95,7 +101,7 @@ def report_system():
 def sweep_baseline():
     results = {}
     header("BASELINE NATIVE GEMM - TFLOPS by size")
-    print(f"{'size':<12}{'FP32':>10}{'FP16':>10}{'BF16':>10}")
+    print(f"{'size':<16}{'FP32':>10}{'FP16':>10}{'BF16':>10}")
     for label, m, k, n in MATMUL_SIZES:
         flops = 2.0 * m * k * n
         iters, warm = auto_iters(m, k, n), auto_warm(m, k, n)
@@ -113,11 +119,11 @@ def sweep_baseline():
             row.append(tflops)
             del lin, x
         torch.cuda.empty_cache()
-        print(f"{row[0]:<12}{row[1]:>10.1f}{row[2]:>10.1f}{row[3]:>10.1f}", flush=True)
+        print(f"{row[0]:<16}{row[1]:>10.1f}{row[2]:>10.1f}{row[3]:>10.1f}", flush=True)
     return results
 
 
-def sweep_torchao():
+def sweep_torchao(baseline):
     from torchao.quantization import (
         quantize_,
         Int8WeightOnlyConfig,
@@ -127,78 +133,159 @@ def sweep_torchao():
         Float8DynamicActivationFloat8WeightConfig,
     )
     configs = [
-        ("FP8-dyn (app transformer)", Float8DynamicActivationFloat8WeightConfig),
-        ("FP8-wt-only", Float8WeightOnlyConfig),
-        ("INT8-wt (app text_enc)", Int8WeightOnlyConfig),
-        ("INT8-dyn", Int8DynamicActivationInt8WeightConfig),
+        ("FP8-dyn (app transformer)", Float8DynamicActivationFloat8WeightConfig()),
+        ("FP8-wt-only", Float8WeightOnlyConfig()),
+        ("INT8-wt (app text_enc)", Int8WeightOnlyConfig()),
+        ("INT8-dyn", Int8DynamicActivationInt8WeightConfig()),
         ("INT4-g128", Int4WeightOnlyConfig(group_size=128)),
     ]
     results = {}
     for name, cfg in configs:
         header("TORCHAO: " + name)
-        print(f"{'size':<12}{'ms':>10}{'TFLOPS':>10}{'vs BF16':>9}{'mem':>8}")
+        print(f"{'size':<16}{'ms':>10}{'TFLOPS':>10}{'vs BF16':>9}{'mem':>8}")
         for label, m, k, n in MATMUL_SIZES:
             flops = 2.0 * m * k * n
             iters, warm = auto_iters(m, k, n), auto_warm(m, k, n)
             try:
                 lin = Linear(k, n, bias=False, device=DEV, dtype=torch.bfloat16)
-                quantize_(lin, cfg())
+                quantize_(lin, cfg)
                 torch._dynamo.reset()
                 x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
                 torch.cuda.reset_peak_memory_stats()
                 ms = bench_linear(lin, x, iters, warm)
                 tflops = flops / (ms / 1e3) / 1e12
                 mem = torch.cuda.max_memory_allocated() / 2**30
-                base = results.get("BF16", {}).get(label)
+                base = baseline.get("BF16", {}).get(label)
                 vs = tflops / base if base else float("nan")
                 results.setdefault(name, {})[label] = tflops
-                print(f"{label:<12}{ms:>10.3f}{tflops:>10.1f}{vs:>9.2f}x{mem:>8.1f}", flush=True)
+                print(f"{label:<16}{ms:>10.3f}{tflops:>10.1f}{vs:>9.2f}x{mem:>8.1f}", flush=True)
             except Exception as err:
-                print(f"{label:<12}FAILED: {type(err).__name__}: {err}", flush=True)
+                print(f"{label:<16}FAILED: {type(err).__name__}: {err}", flush=True)
             torch.cuda.empty_cache()
     return results
 
 
+def time_sdpa(q, k, v, backend, iters, warm=1):
+    from torch.nn.attention import sdpa_kernel
+    fn = lambda: F.scaled_dot_product_attention(q, k, v)
+    with sdpa_kernel(backend):
+        for _ in range(warm):
+            fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    with sdpa_kernel(backend):
+        for _ in range(iters):
+            fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+
 def sweep_sdpa():
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    header("SDPA ATTENTION (native CUDA kernels - no triton required)")
+    from torch.nn.attention import SDPBackend
+    header("SDPA ATTENTION (84,672 = real patched seq at 896^2@105f)")
+    sdpa_tflops = {}
     H, HD = 40, 128
-    backends = [
-        ("flash", SDPBackend.FLASH_ATTENTION, torch.backends.cuda.flash_sdp_enabled()),
-        ("mem_eff", SDPBackend.EFFICIENT_ATTENTION, torch.backends.cuda.mem_efficient_sdp_enabled()),
-        ("math", SDPBackend.MATH, True),
-    ]
-    for L in [4096, 90112, 338688]:
-        q = torch.randn(1, H, L, HD, device=DEV, dtype=torch.bfloat16)
-        k = torch.randn(1, H, L, HD, device=DEV, dtype=torch.bfloat16)
-        v = torch.randn(1, H, L, HD, device=DEV, dtype=torch.bfloat16)
-        flops = 2.0 * L * L * H * HD
-        iters = 2 if L > 100000 else 5
-        print(f"\nseq={L:<8} FLOPs/iter={flops/1e12:.2f} TFLOP")
-        for bname, backend, enabled in backends:
-            if not enabled or (backend == SDPBackend.MATH and L > 8192):
-                print(f"  {bname:<10} skipped", flush=True)
-                continue
-            try:
-                fn = lambda: F.scaled_dot_product_attention(q, k, v)
-                with sdpa_kernel(backend):
-                    for _ in range(1):
-                        fn()
-                torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                with sdpa_kernel(backend):
-                    for _ in range(iters):
-                        fn()
-                end.record()
-                torch.cuda.synchronize()
-                ms = start.elapsed_time(end) / iters
-                print(f"  {bname:<10} {ms:>8.2f} ms  {flops / (ms / 1e3) / 1e12:>8.1f} TFLOPS", flush=True)
-            except Exception as err:
-                print(f"  {bname:<10} FAILED: {type(err).__name__}: {err}", flush=True)
-        del q, k, v
+    cudnn_backend = getattr(SDPBackend, "CUDNN_ATTENTION", None)
+    backends = [("mem_eff", SDPBackend.EFFICIENT_ATTENTION)]
+    if cudnn_backend is not None:
+        backends.append(("cudnn", cudnn_backend))
+    if torch.backends.cuda.flash_sdp_enabled():
+        backends.append(("flash", SDPBackend.FLASH_ATTENTION))
+    for L in [4096, 43200, 84672, 110592]:
+        for dt in [torch.bfloat16, torch.float16]:
+            q = torch.randn(1, H, L, HD, device=DEV, dtype=dt)
+            k = torch.randn(1, H, L, HD, device=DEV, dtype=dt)
+            v = torch.randn(1, H, L, HD, device=DEV, dtype=dt)
+            flops = 2.0 * L * L * H * HD
+            iters = 2 if L > 50000 else 5
+            print(f"\nseq={L:<8} dtype={str(dt).replace('torch.',''):<9} FLOPs/iter={flops/1e12:.2f} TFLOP")
+            for bname, backend in backends:
+                try:
+                    ms = time_sdpa(q, k, v, backend, iters)
+                    tf = flops / (ms / 1e3) / 1e12
+                    sdpa_tflops.setdefault(bname, {})[L] = tf
+                    print(f"  {bname:<10} {ms:>9.2f} ms  {tf:>8.1f} TFLOPS", flush=True)
+                except Exception as err:
+                    print(f"  {bname:<10} FAILED: {str(err)[:90]}", flush=True)
+            del q, k, v
+            torch.cuda.empty_cache()
+    if cudnn_backend is not None and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        header("CUDA GRAPHS-FREE EXPERIMENT: enable_cudnn_sdp(True) re-test")
+        torch.backends.cuda.enable_cudnn_sdp(True)
+        print("cudnn-sdp now:", torch.backends.cuda.cudnn_sdp_enabled(), flush=True)
+        for L in [84672, 110592]:
+            for dt in [torch.bfloat16, torch.float16]:
+                q = torch.randn(1, H, L, HD, device=DEV, dtype=dt)
+                k = torch.randn(1, H, L, HD, device=DEV, dtype=dt)
+                v = torch.randn(1, H, L, HD, device=DEV, dtype=dt)
+                flops = 2.0 * L * L * H * HD
+                try:
+                    ms = time_sdpa(q, k, v, cudnn_backend, 2)
+                    tf = flops / (ms / 1e3) / 1e12
+                    sdpa_tflops.setdefault("cudnn", {})[L] = tf
+                    print(f"seq={L} dtype={str(dt).replace('torch.','')} cudnn {ms:>9.2f} ms  {tf:>8.1f} TFLOPS", flush=True)
+                except Exception as err:
+                    print(f"seq={L} dtype={str(dt).replace('torch.','')} cudnn FAILED: {str(err)[:120]}", flush=True)
+                del q, k, v
+                torch.cuda.empty_cache()
+    return sdpa_tflops
+
+
+class ProxyWanBlock(torch.nn.Module):
+    def __init__(self, dim=5120, ffn=13824, heads=40):
+        super().__init__()
+        self.heads = heads
+        self.norm1 = torch.nn.RMSNorm(dim, eps=1e-6)
+        self.to_q = Linear(dim, dim, bias=True)
+        self.to_k = Linear(dim, dim, bias=True)
+        self.to_v = Linear(dim, dim, bias=True)
+        self.to_out = Linear(dim, dim, bias=True)
+        self.ffn_up = Linear(dim, ffn, bias=True)
+        self.ffn_down = Linear(ffn, dim, bias=True)
+
+    def forward(self, x):
+        h = self.norm1(x)
+        q = self.to_q(h).unflatten(2, (self.heads, -1)).transpose(1, 2)
+        k = self.to_k(h).unflatten(2, (self.heads, -1)).transpose(1, 2)
+        v = self.to_v(h).unflatten(2, (self.heads, -1)).transpose(1, 2)
+        attn = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).flatten(2)
+        x = x + self.to_out(attn)
+        y = self.ffn_down(F.silu(self.ffn_up(x)))
+        return x + y
+
+
+def proxy_block_test():
+    from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
+    header("REAL-SHAPE PROXY: 1 Wan-like block @ 84,672 tokens (fp8-dyn vs bf16)")
+    L = 84672
+    x = torch.randn(1, L, 5120, device=DEV, dtype=torch.bfloat16)
+    for name in ["BF16 (no quant)", "FP8-dyn"]:
+        model = ProxyWanBlock().to(DEV).to(torch.bfloat16)
+        if name.startswith("FP8"):
+            quantize_(model, Float8DynamicActivationFloat8WeightConfig())
+        fn = lambda: model(x)
+        for _ in range(2):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(3):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        per_block = start.elapsed_time(end) / 3
+        n_params = sum(p.numel() for p in model.parameters())
+        weight_flops = 2 * n_params * L
+        print(f"{name:<20} {per_block:>7.1f} ms/block | {per_block/1000*40:>7.1f} s projected x40 blocks | "
+              f"{weight_flops/(per_block/1e3)/1e12:>6.1f} TFLOPS", flush=True)
+        del model
         torch.cuda.empty_cache()
+    print("\nreference: your app measures ~75.6s per real forward (fp8-dyn, UniPC 6 steps)")
+    print("          proxy x40 should land in the same ballpark if the microbench is representative")
 
 
 def bench_bandwidth():
@@ -206,46 +293,49 @@ def bench_bandwidth():
     n = 2**30
     buf = torch.randn(n, device=DEV, dtype=torch.bfloat16)
     torch.cuda.synchronize()
-    t0 = time.time()
-    _ = buf.clone()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(10):
+        _ = buf.clone()
+    end.record()
     torch.cuda.synchronize()
-    d2d = 2 * 2 * n / 1e9 / (time.time() - t0)
-    print(f"GPU->GPU copy : {d2d:>8.0f} GB/s")
-    t0 = time.time()
+    d2d_s = start.elapsed_time(end) / 1000 / 10
+    print(f"GPU->GPU copy : {2 * 2 * n / 1e9 / d2d_s:>8.0f} GB/s")
+    t0 = time.perf_counter()
     c = buf.to("cpu")
     torch.cuda.synchronize()
-    h2d_time = time.time() - t0
-    print(f"GPU->CPU      : {2 * n / 1e9 / h2d_time:>8.0f} GB/s")
-    t0 = time.time()
+    d2h_s = time.perf_counter() - t0
+    print(f"GPU->CPU      : {2 * n / 1e9 / d2h_s:>8.0f} GB/s")
+    t0 = time.perf_counter()
     g = c.to(DEV)
     torch.cuda.synchronize()
-    d2h_time = time.time() - t0
-    print(f"CPU->GPU      : {2 * n / 1e9 / d2h_time:>8.0f} GB/s")
+    h2d_s = time.perf_counter() - t0
+    print(f"CPU->GPU      : {2 * n / 1e9 / h2d_s:>8.0f} GB/s")
     swap_gb = 14.3
     print(f"est. full 14.3GB transformer swap (CPU->GPU then GPU->CPU): "
-          f"{swap_gb / (2 * n / 1e9 / h2d_time) + swap_gb / (2 * n / 1e9 / d2h_time):.2f} s")
-    print("(your log shows ~13s/step overhead that is NOT this swap - it recurs within a resident phase)")
+          f"{swap_gb / (2 * n / 1e9 / d2h_s) + swap_gb / (2 * n / 1e9 / h2d_s):.2f} s")
     del buf, c, g
 
 
-def projection(results):
-    header("PROJECTED WAN 14.3B TRANSFORMER FORWARD (weight-FLOPs, attention extra ~5-15%)")
-    print(f"{'config':<28}" + "".join(f"{t:>16}" for t in TOKENS))
-    names = ["BF16", "FP16"]
-    for n in results:
-        if n not in ["BF16", "FP16"]:
-            names.append(n)
-    for name in names:
-        row = results.get(name)
-        if not row:
-            continue
-        tflops = max(row.values())
-        cells = []
-        for label, T in TOKENS.items():
-            flops = 2 * WAN_PARAMS * T
-            cells.append(f"{flops / tflops / 1e12:>16.1f}s")
-        print(f"{name:<28}" + "".join(cells))
-    print("\nreference: your 896^2 @ 105f run measured ~75.6s per forward -> ~128 TFLOPS effective")
+def projection(results, sdpa_tflops):
+    header("PROJECTED REAL FORWARD 896^2@105f (weights + full attention, 40 blocks)")
+    gemm = results.get("FP8-dyn (app transformer)", {})
+    gemm_tf = max(gemm.values()) if gemm else 128.0
+    attn_tf = 46.0
+    for bname in ["mem_eff", "cudnn"]:
+        d = sdpa_tflops.get(bname, {})
+        if d and 84672 in d:
+            attn_tf = max(attn_tf, d[84672])
+            print(f"using SDPA backend '{bname}' @ {d[84672]:.0f} TFLOPS for attention")
+            break
+    seq = PATCHED_TOKENS["896^2@105f"]
+    w_time = 2 * WAN_PARAMS * seq / gemm_tf / 1e12
+    a_time = WAN_LAYERS * 2 * seq * seq * WAN_HEAD_DIM / attn_tf / 1e12
+    print(f"weights (fp8-dyn {gemm_tf:.0f} TFLOPS) : {w_time:>6.1f} s")
+    print(f"attention (SDPA {attn_tf:.0f} TFLOPS)  : {a_time:>6.1f} s")
+    print(f"projected forward                    : {w_time + a_time:>6.1f} s  (observed: 75.6s)")
+    print(f"\nattention share of forward: {a_time/(w_time+a_time)*100:.0f}% -> attention backend is the lever")
 
 
 def summary(results):
@@ -266,10 +356,11 @@ def summary(results):
 if __name__ == "__main__":
     report_system()
     baseline = sweep_baseline()
-    torchao_results = sweep_torchao()
+    torchao_results = sweep_torchao(baseline)
     results = {**baseline, **torchao_results}
-    sweep_sdpa()
+    sdpa_tflops = sweep_sdpa()
+    proxy_block_test()
     bench_bandwidth()
-    projection(results)
+    projection(results, sdpa_tflops)
     summary(results)
     print("\nDONE")
