@@ -178,20 +178,23 @@ def download_lora(group_name):
 
 def load_lora_to_pipe(pipe, group_name, adapter_name="lora"):
     high_path, low_path = download_lora(group_name)
-    if high_path and low_path:
-        pipe.load_lora_weights(high_path, adapter_name=f"{adapter_name}_high")
-        pipe.load_lora_weights(low_path, adapter_name=f"{adapter_name}_low")
-        print(f"Loaded LoRA pair: {group_name}")
-        return True
-    elif high_path:
-        pipe.load_lora_weights(high_path, adapter_name=adapter_name)
-        print(f"Loaded LoRA: {group_name}")
-        return True
-    elif low_path:
-        pipe.load_lora_weights(low_path, adapter_name=adapter_name)
-        print(f"Loaded LoRA (low): {group_name}")
-        return True
-    return False
+    loaded_any = False
+    try:
+        if high_path:
+            pipe.load_lora_weights(high_path, adapter_name=f"{adapter_name}_high")
+            loaded_any = True
+        if low_path:
+            pipe.load_lora_weights(low_path, adapter_name=f"{adapter_name}_low")
+            loaded_any = True
+        if loaded_any:
+            print(f"Loaded LoRA: {group_name}")
+        else:
+            print(f"No LoRA files found for: {group_name}")
+        return loaded_any
+    except Exception as e:
+        print(f"Failed to load LoRA {group_name}: {e}")
+        pipe.unload_lora_weights()
+        raise
 
 
 def unload_lora(pipe):

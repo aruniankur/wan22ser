@@ -724,6 +724,8 @@ def run_inference(
             print(f"LoRA loaded: {lora_groups}")
         except Exception as e:
             print(f"LoRA warning: {e}")
+            pipe.unload_lora_weights()
+            lora_loaded = False
 
     try:
         t_pipe = time.time()
