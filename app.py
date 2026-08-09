@@ -285,6 +285,181 @@ SCHEDULER_MAP = {
     "DPMSolverSinglestep": DPMSolverSinglestepScheduler,
 }
 
+# --- BF16 NORMS PATCH (remove fp32 activation upcasts) ---
+# Wan 2.2's transformer upcasts the hidden state to fp32 at every norm and
+# residual-add (40 blocks x ~6 copies) -> ~40GB peak activation memory.
+# This patch runs those ops in the input dtype (bf16) instead. Disable with BF16_NORMS=0.
+BF16_NORMS = os.environ.get("BF16_NORMS", "1") == "1"
+
+if BF16_NORMS:
+    try:
+        import inspect
+        from diffusers.models.normalization import FP32LayerNorm
+        from diffusers.models.transformers import transformer_wan as _tw
+        from diffusers.models.transformers.transformer_wan import WanTransformer3DModel, WanTransformerBlock
+
+        # 1) LayerNorm: run in input dtype instead of upcasting to fp32.
+        def _bf16_layer_norm_forward(self, inputs):
+            origin_dtype = inputs.dtype
+            return F.layer_norm(
+                inputs,
+                self.normalized_shape,
+                self.weight.to(origin_dtype) if self.weight is not None else None,
+                self.bias.to(origin_dtype) if self.bias is not None else None,
+                self.eps,
+            )
+
+        # 2) Transformer block: drop .float() on the modulated norms, the residual
+        #    stream adds, and the scale_shift_table/temb modulation path.
+        def _bf16_wan_block_forward(self, hidden_states, encoder_hidden_states, temb, rotary_emb):
+            h_dtype = hidden_states.dtype
+            scale_shift = self.scale_shift_table.to(h_dtype)
+            temb = temb.to(h_dtype)
+            if temb.ndim == 4:
+                shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                    scale_shift + temb
+                ).chunk(6, dim=2)
+                shift_msa = shift_msa.squeeze(2)
+                scale_msa = scale_msa.squeeze(2)
+                gate_msa = gate_msa.squeeze(2)
+                c_shift_msa = c_shift_msa.squeeze(2)
+                c_scale_msa = c_scale_msa.squeeze(2)
+                c_gate_msa = c_gate_msa.squeeze(2)
+            else:
+                shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                    scale_shift + temb
+                ).chunk(6, dim=1)
+
+            norm_hidden_states = self.norm1(hidden_states) * (1 + scale_msa) + shift_msa
+            attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
+            hidden_states = hidden_states + attn_output.to(h_dtype) * gate_msa
+
+            norm_hidden_states = self.norm2(hidden_states)
+            attn_output = self.attn2(norm_hidden_states, encoder_hidden_states.to(h_dtype), None, None)
+            hidden_states = hidden_states + attn_output.to(h_dtype)
+
+            norm_hidden_states = self.norm3(hidden_states) * (1 + c_scale_msa) + c_shift_msa
+            ff_output = self.ffn(norm_hidden_states)
+            hidden_states = hidden_states + ff_output.to(h_dtype) * c_gate_msa
+
+            return hidden_states
+
+        # 3) Main transformer forward: drop the final .float() on norm_out.
+        def _bf16_wan3d_forward(
+            self,
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            encoder_hidden_states_image=None,
+            return_dict=True,
+            attention_kwargs=None,
+        ):
+            if attention_kwargs is not None:
+                attention_kwargs = attention_kwargs.copy()
+                lora_scale = attention_kwargs.pop("scale", 1.0)
+            else:
+                lora_scale = 1.0
+
+            if _tw.USE_PEFT_BACKEND:
+                _tw.scale_lora_layers(self, lora_scale)
+            else:
+                if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
+                    _tw.logger.warning(
+                        "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
+                    )
+
+            batch_size, num_channels, num_frames, height, width = hidden_states.shape
+            p_t, p_h, p_w = self.config.patch_size
+            post_patch_num_frames = num_frames // p_t
+            post_patch_height = height // p_h
+            post_patch_width = width // p_w
+
+            rotary_emb = self.rope(hidden_states)
+
+            hidden_states = self.patch_embedding(hidden_states)
+            hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+            if timestep.ndim == 2:
+                ts_seq_len = timestep.shape[1]
+                timestep = timestep.flatten()
+            else:
+                ts_seq_len = None
+
+            temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+                timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
+            )
+            if ts_seq_len is not None:
+                timestep_proj = timestep_proj.unflatten(2, (6, -1))
+            else:
+                timestep_proj = timestep_proj.unflatten(1, (6, -1))
+
+            if encoder_hidden_states_image is not None:
+                encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                for block in self.blocks:
+                    hidden_states = self._gradient_checkpointing_func(
+                        block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    )
+            else:
+                for block in self.blocks:
+                    hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+
+            if temb.ndim == 3:
+                shift, scale = (
+                    self.scale_shift_table.unsqueeze(0).to(hidden_states.dtype)
+                    + temb.unsqueeze(2).to(hidden_states.dtype)
+                ).chunk(2, dim=2)
+                shift = shift.squeeze(2)
+                scale = scale.squeeze(2)
+            else:
+                shift, scale = (
+                    self.scale_shift_table.to(hidden_states.dtype) + temb.unsqueeze(1).to(hidden_states.dtype)
+                ).chunk(2, dim=1)
+
+            shift = shift.to(hidden_states.device)
+            scale = scale.to(hidden_states.device)
+
+            hidden_states = (self.norm_out(hidden_states) * (1 + scale) + shift).type_as(hidden_states)
+            hidden_states = self.proj_out(hidden_states)
+
+            hidden_states = hidden_states.reshape(
+                batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+            )
+            hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+            output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+            if _tw.USE_PEFT_BACKEND:
+                _tw.unscale_lora_layers(self, lora_scale)
+
+            if not return_dict:
+                return (output,)
+
+            return _tw.Transformer2DModelOutput(sample=output)
+
+        patched = []
+
+        FP32LayerNorm.forward = _bf16_layer_norm_forward
+        patched.append("FP32LayerNorm -> bf16")
+
+        if "hidden_states.float() + attn_output" in inspect.getsource(WanTransformerBlock.forward):
+            WanTransformerBlock.forward = _bf16_wan_block_forward
+            patched.append("WanTransformerBlock residual adds -> bf16")
+        else:
+            print("[DEBUG] BF16 norms patch: WanTransformerBlock source mismatch - skipping block patch", flush=True)
+
+        if "norm_out(hidden_states.float())" in inspect.getsource(WanTransformer3DModel.forward):
+            WanTransformer3DModel.forward = _bf16_wan3d_forward
+            patched.append("WanTransformer3DModel final norm -> bf16")
+        else:
+            print("[DEBUG] BF16 norms patch: WanTransformer3DModel source mismatch - skipping final-norm patch", flush=True)
+
+        print(f"[DEBUG] BF16 norms patch: ENABLED ({', '.join(patched)}) - set BF16_NORMS=0 to disable", flush=True)
+    except Exception as _bf16_err:
+        print(f"[DEBUG] BF16 norms patch: FAILED ({_bf16_err}) - falling back to fp32 norms", flush=True)
+
+# --- END BF16 NORMS PATCH ---
+
 print(f"[DEBUG] Loading pipeline {MODEL_ID} (bf16, CPU)...", flush=True)
 t0 = time.time()
 pipe = WanImageToVideoPipeline.from_pretrained(
