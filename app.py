@@ -5,6 +5,7 @@ import tempfile
 import warnings
 import time
 import gc
+import threading
 import uuid
 from tqdm import tqdm
 import cv2
@@ -114,13 +115,142 @@ def ram_mem_gib():
         return 0.0
 
 
+# --- MEMORY INSTRUMENTATION (always on) ---
+
+RAM_PEAK_GIB = 0.0
+_RAM_WATCHER_STARTED = False
+PHASE_STATS = {}  # component name -> max VRAM peak (GiB) seen during its forward calls
+
+
+def _ram_watcher():
+    global RAM_PEAK_GIB
+    while True:
+        try:
+            rss = ram_mem_gib()
+            if rss > RAM_PEAK_GIB:
+                RAM_PEAK_GIB = rss
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+
+def start_ram_watcher():
+    global _RAM_WATCHER_STARTED
+    if not _RAM_WATCHER_STARTED:
+        _RAM_WATCHER_STARTED = True
+        threading.Thread(target=_ram_watcher, daemon=True).start()
+        print("[DEBUG] RAM peak watcher started (200ms poll)", flush=True)
+
+
 def dbg(label, t0=None):
     alloc, reserved = gpu_mem_gib()
     elapsed = f" (+{time.time() - t0:.1f}s)" if t0 else ""
     print(
-        f"[DEBUG] {label}{elapsed} | GPU alloc={alloc:.2f} GiB reserved={reserved:.2f} GiB | RAM={ram_mem_gib():.2f} GiB",
+        f"[DEBUG] {label}{elapsed} | GPU alloc={alloc:.2f} GiB reserved={reserved:.2f} GiB | RAM={ram_mem_gib():.2f} GiB | RAMpeak={RAM_PEAK_GIB:.2f} GiB",
         flush=True,
     )
+
+
+def dbg_peak(label, t0=None):
+    alloc, reserved = gpu_mem_gib()
+    peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+    elapsed = f" (+{time.time() - t0:.1f}s)" if t0 else ""
+    print(
+        f"[DEBUG] {label}{elapsed} | GPU alloc={alloc:.2f} GiB reserved={reserved:.2f} GiB | PEAK-since-reset={peak:.2f} GiB | RAM={ram_mem_gib():.2f} GiB | RAMpeak={RAM_PEAK_GIB:.2f} GiB",
+        flush=True,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _make_phase_hooks(name):
+    state = {"t0": None, "base_ram": None, "peak": 0.0}
+
+    def pre_hook(module, args):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        state["t0"] = time.time()
+        state["base_ram"] = ram_mem_gib()
+        alloc = torch.cuda.memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        print(
+            f"[PHASE] >>> {name} START | GPU alloc={alloc:.2f} GiB | RAM={state['base_ram']:.2f} GiB | RAMpeak={RAM_PEAK_GIB:.2f} GiB",
+            flush=True,
+        )
+
+    def post_hook(module, args, output):
+        dt = time.time() - state["t0"]
+        peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        alloc = torch.cuda.memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        state["peak"] = max(state["peak"], peak)
+        PHASE_STATS[name] = state["peak"]
+        print(
+            f"[PHASE] <<< {name} END +{dt:.1f}s | PEAK VRAM={peak:.2f} GiB | GPU alloc={alloc:.2f} GiB | RAM={ram_mem_gib():.2f} GiB | RAMpeak={RAM_PEAK_GIB:.2f} GiB",
+            flush=True,
+        )
+
+    return pre_hook, post_hook
+
+
+def _make_method_phase_hook(name, obj, method_name):
+    # VAE decode/encode are methods (not forward), so wrap them directly.
+    state = {"t0": None, "peak": 0.0}
+    orig = getattr(obj, method_name)
+
+    def wrapped(*args, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        state["t0"] = time.time()
+        alloc = torch.cuda.memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        print(
+            f"[PHASE] >>> {name}.{method_name} START | GPU alloc={alloc:.2f} GiB | RAM={ram_mem_gib():.2f} GiB | RAMpeak={RAM_PEAK_GIB:.2f} GiB",
+            flush=True,
+        )
+        out = orig(*args, **kwargs)
+        dt = time.time() - state["t0"]
+        peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        state["peak"] = max(state["peak"], peak)
+        PHASE_STATS[name] = state["peak"]
+        print(
+            f"[PHASE] <<< {name}.{method_name} END +{dt:.1f}s | PEAK VRAM={peak:.2f} GiB | RAM={ram_mem_gib():.2f} GiB | RAMpeak={RAM_PEAK_GIB:.2f} GiB",
+            flush=True,
+        )
+        return out
+
+    setattr(obj, method_name, wrapped)
+    return wrapped
+
+
+def register_phase_hooks(pipe):
+    for name in ["text_encoder", "transformer", "transformer_2"]:
+        comp = getattr(pipe, name, None)
+        if comp is None:
+            continue
+        pre_hook, post_hook = _make_phase_hooks(name)
+        comp.register_forward_pre_hook(pre_hook)
+        comp.register_forward_hook(post_hook)
+        print(f"[DEBUG] phase hook registered: {name}", flush=True)
+    if getattr(pipe, "vae", None) is not None:
+        for m in ["encode", "decode"]:
+            if hasattr(pipe.vae, m):
+                _make_method_phase_hook("vae", pipe.vae, m)
+                print(f"[DEBUG] phase hook registered: vae.{m}", flush=True)
+
+
+def _make_step_cb(total_steps, t_pipe):
+    last = {"t": t_pipe}
+
+    def step_cb(pipe, step, timestep, callback_kwargs):
+        now = time.time()
+        dt = now - last["t"]
+        last["t"] = now
+        alloc, reserved = gpu_mem_gib()
+        print(
+            f"[STEP] {step + 1}/{total_steps} +{dt:.1f}s | GPU alloc={alloc:.2f} GiB reserved={reserved:.2f} GiB | RAM={ram_mem_gib():.2f} GiB | RAMpeak={RAM_PEAK_GIB:.2f} GiB",
+            flush=True,
+        )
+        return callback_kwargs
+
+    return step_cb
 
 
 # RIFE
@@ -135,6 +265,8 @@ if not os.path.exists("RIFEv4.26_0921.zip"):
     with zipfile.ZipFile("RIFEv4.26_0921.zip") as z:
         z.extractall(".")
     print("RIFE Model extracted.")
+
+start_ram_watcher()
 
 # sys.path.append(os.getcwd())
 
@@ -417,6 +549,7 @@ pipe.vae.enable_tiling()
 dbg("VAE tiling/slicing enabled")
 
 original_scheduler = copy.deepcopy(pipe.scheduler)
+register_phase_hooks(pipe)
 dbg("model load complete")
 
 for i, lora in enumerate(LORA_MODELS):
@@ -546,6 +679,7 @@ def run_inference(
     print(f"Generating {num_frames} frames, task: {task_name}, {duration_seconds}, {resized_image.size}, lora={lora_groups}")
     dbg(f"run_inference start (steps={steps}, guidance={guidance_scale}/{guidance_scale_2}, frames={num_frames}, scheduler={scheduler_name})")
     start = time.time()
+    PHASE_STATS.clear()
 
     lora_loaded = False
     if lora_groups:
@@ -559,6 +693,8 @@ def run_inference(
             print(f"LoRA warning: {e}")
 
     try:
+        t_pipe = time.time()
+        pipe_cb = _make_step_cb(int(steps), t_pipe)
         result = pipe(
             image=resized_image,
             last_image=processed_last_image,
@@ -571,6 +707,7 @@ def run_inference(
             guidance_scale_2=float(guidance_scale_2),
             num_inference_steps=int(steps),
             generator=torch.Generator(device="cuda").manual_seed(current_seed),
+            callback_on_step_end=pipe_cb,
             output_type="np"
         )
     except torch.cuda.OutOfMemoryError as e:
@@ -588,7 +725,11 @@ def run_inference(
     if lora_loaded:
         lora_loader.unload_lora(pipe)
 
-    dbg("inference finished")
+    if PHASE_STATS:
+        phases = ", ".join(f"{k}={v:.2f}GiB" for k, v in PHASE_STATS.items() if v > 0)
+        overall = max(PHASE_STATS.values())
+        print(f"[DEBUG] PHASE peak VRAM | {phases} | overall={overall:.2f} GiB", flush=True)
+    dbg("inference finished", t_pipe)
     print("gen time passed:", time.time() - start)
 
     raw_frames_np = result.frames[0]  # Returns (T, H, W, C) float32
@@ -604,6 +745,7 @@ def run_inference(
         print("Interpolation time passed:", time.time() - start)
     else:
         final_frames = list(raw_frames_np)
+    dbg_peak("frame processing done")
 
     final_fps = FIXED_FPS * int(frame_factor)
 
@@ -616,6 +758,7 @@ def run_inference(
         export_to_video(final_frames, video_path, fps=final_fps, quality=quality)
         pbar.update(1)
     print(f"Export time passed, {final_fps} FPS:", time.time() - start)
+    dbg_peak("export done")
 
     return video_path, task_name
 
@@ -721,7 +864,7 @@ def generate_video(
         lora_groups,
         progress,
     )
-    print(f"GPU complete: {task_n}")
+    print(f"GPU complete: {task_n} | RAM peak so far={RAM_PEAK_GIB:.2f} GiB")
 
     return (video_path if video_component else None), video_path, current_seed
 
