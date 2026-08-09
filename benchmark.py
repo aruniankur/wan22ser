@@ -1,347 +1,293 @@
-#!/usr/bin/env python3
-
 import time
 import torch
 
 # ============================================================
-# Configuration
+# CONFIG
 # ============================================================
 
-DEVICE = "cuda"
-N = 4096                 # Matrix size
-WARMUP = 20
+M = 10000
+K = 10000
+N = 10000
+
+WARMUP = 30
 ITERATIONS = 100
 
-print("=" * 70)
-print("NVIDIA CUDA Datatype Benchmark")
-print("=" * 70)
+device = "cuda"
 
-# ------------------------------------------------------------
-# GPU information
-# ------------------------------------------------------------
+torch.set_grad_enabled(False)
 
-if not torch.cuda.is_available():
-    raise RuntimeError("CUDA is not available.")
+print("=" * 75)
+print("L40 PyTorch / TorchAO Precision Benchmark")
+print("=" * 75)
 
-gpu = torch.cuda.get_device_name(0)
-props = torch.cuda.get_device_properties(0)
-
-print(f"GPU           : {gpu}")
-print(f"Compute       : {props.major}.{props.minor}")
-print(f"CUDA          : {torch.version.cuda}")
-print(f"PyTorch       : {torch.__version__}")
-print(f"Matrix size   : {N} x {N}")
-print("=" * 70)
+print("GPU       :", torch.cuda.get_device_name(0))
+print("CUDA      :", torch.version.cuda)
+print("PyTorch   :", torch.__version__)
+print("M,K,N     :", M, K, N)
+print("=" * 75)
 
 
 # ============================================================
-# Benchmark helper
+# BENCHMARK
 # ============================================================
 
-def benchmark_gemm(name, dtype, operation="matmul"):
-    """
-    Benchmark C = A @ B.
-
-    For floating point:
-        FLOPs = 2*N^3
-
-    For integer:
-        Operations = 2*N^3
-    """
+def benchmark(name, fn, ops):
 
     print(f"\n{name}")
 
-    try:
-        if dtype == "fp64":
-            A = torch.randn((N, N), device=DEVICE, dtype=torch.float64)
-            B = torch.randn((N, N), device=DEVICE, dtype=torch.float64)
+    # Warmup
+    for _ in range(WARMUP):
+        y = fn()
 
-            # Warmup
-            for _ in range(WARMUP):
-                C = torch.matmul(A, B)
+    torch.cuda.synchronize()
 
-            torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
 
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+    start.record()
 
-            start.record()
+    for _ in range(ITERATIONS):
+        y = fn()
 
-            for _ in range(ITERATIONS):
-                C = torch.matmul(A, B)
+    end.record()
 
-            end.record()
-            torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-        elif dtype == "fp32":
-            A = torch.randn((N, N), device=DEVICE, dtype=torch.float32)
-            B = torch.randn((N, N), device=DEVICE, dtype=torch.float32)
+    total_ms = start.elapsed_time(end)
+    avg_ms = total_ms / ITERATIONS
 
-            for _ in range(WARMUP):
-                C = torch.matmul(A, B)
+    tflops = ops / (avg_ms / 1000) / 1e12
 
-            torch.cuda.synchronize()
+    print(f"Time        : {avg_ms:.4f} ms")
+    print(f"Throughput  : {tflops:.2f} TFLOPS/TOPS")
 
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+    return avg_ms, tflops
 
-            start.record()
 
-            for _ in range(ITERATIONS):
-                C = torch.matmul(A, B)
-
-            end.record()
-            torch.cuda.synchronize()
-
-        elif dtype == "fp16":
-            A = torch.randn((N, N), device=DEVICE, dtype=torch.float16)
-            B = torch.randn((N, N), device=DEVICE, dtype=torch.float16)
-
-            for _ in range(WARMUP):
-                C = torch.matmul(A, B)
-
-            torch.cuda.synchronize()
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-
-            start.record()
-
-            for _ in range(ITERATIONS):
-                C = torch.matmul(A, B)
-
-            end.record()
-            torch.cuda.synchronize()
-
-        elif dtype == "bf16":
-            A = torch.randn((N, N), device=DEVICE, dtype=torch.bfloat16)
-            B = torch.randn((N, N), device=DEVICE, dtype=torch.bfloat16)
-
-            for _ in range(WARMUP):
-                C = torch.matmul(A, B)
-
-            torch.cuda.synchronize()
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-
-            start.record()
-
-            for _ in range(ITERATIONS):
-                C = torch.matmul(A, B)
-
-            end.record()
-            torch.cuda.synchronize()
-
-        else:
-            print("Datatype handled separately.")
-            return None
-
-        total_ms = start.elapsed_time(end)
-        avg_ms = total_ms / ITERATIONS
-
-        # Matrix multiplication:
-        # A(NxN) @ B(NxN)
-        # approximately 2*N^3 floating-point operations
-        operations = 2 * (N ** 3)
-
-        tflops = operations / (avg_ms / 1000) / 1e12
-
-        print(f"Average time : {avg_ms:.4f} ms")
-        print(f"Performance  : {tflops:.2f} TFLOPS")
-
-        return tflops
-
-    except Exception as e:
-        print(f"FAILED: {e}")
-        return None
+# GEMM operations
+OPS = 2 * M * K * N
 
 
 # ============================================================
-# Integer benchmark
+# FP32
 # ============================================================
 
-def benchmark_int8():
-    print("\nINT8")
+x = torch.randn(
+    M, K,
+    device=device,
+    dtype=torch.float32
+)
 
-    try:
-        # INT8 GEMM
-        A = torch.randint(
-            -128, 127,
-            (N, N),
-            device=DEVICE,
-            dtype=torch.int8
+linear_fp32 = torch.nn.Linear(
+    K, N,
+    bias=False,
+    device=device,
+    dtype=torch.float32
+)
+
+benchmark(
+    "FP32",
+    lambda: linear_fp32(x),
+    OPS
+)
+
+
+# ============================================================
+# FP16
+# ============================================================
+
+x = torch.randn(
+    M, K,
+    device=device,
+    dtype=torch.float16
+)
+
+linear_fp16 = torch.nn.Linear(
+    K, N,
+    bias=False,
+    device=device,
+    dtype=torch.float16
+)
+
+benchmark(
+    "FP16",
+    lambda: linear_fp16(x),
+    OPS
+)
+
+
+# ============================================================
+# BF16
+# ============================================================
+
+x = torch.randn(
+    M, K,
+    device=device,
+    dtype=torch.bfloat16
+)
+
+linear_bf16 = torch.nn.Linear(
+    K, N,
+    bias=False,
+    device=device,
+    dtype=torch.bfloat16
+)
+
+benchmark(
+    "BF16",
+    lambda: linear_bf16(x),
+    OPS
+)
+
+
+# ============================================================
+# TORCHAO
+# ============================================================
+
+try:
+
+    from torchao.quantization import (
+        quantize_,
+        Int8DynamicActivationInt8WeightConfig,
+        Int4WeightOnlyConfig,
+        Float8DynamicActivationFloat8WeightConfig,
+    )
+
+    print("\nTorchAO detected.")
+
+except Exception as e:
+
+    print("\nTorchAO unavailable:")
+    print(e)
+    print("\nInstall with:")
+    print("pip install torchao")
+
+    raise SystemExit
+
+
+# ============================================================
+# FP8
+# ============================================================
+
+try:
+
+    print("\nCreating FP8 model...")
+
+    model_fp8 = torch.nn.Linear(
+        K,
+        N,
+        bias=False,
+        device=device,
+        dtype=torch.bfloat16
+    )
+
+    quantize_(
+        model_fp8,
+        Float8DynamicActivationFloat8WeightConfig()
+    )
+
+    x = torch.randn(
+        M,
+        K,
+        device=device,
+        dtype=torch.bfloat16
+    )
+
+    benchmark(
+        "FP8 TorchAO",
+        lambda: model_fp8(x),
+        OPS
+    )
+
+except Exception as e:
+
+    print("FP8 FAILED:")
+    print(e)
+
+
+# ============================================================
+# INT8
+# ============================================================
+
+try:
+
+    print("\nCreating INT8 model...")
+
+    model_int8 = torch.nn.Linear(
+        K,
+        N,
+        bias=False,
+        device=device,
+        dtype=torch.bfloat16
+    )
+
+    quantize_(
+        model_int8,
+        Int8DynamicActivationInt8WeightConfig()
+    )
+
+    x = torch.randn(
+        M,
+        K,
+        device=device,
+        dtype=torch.bfloat16
+    )
+
+    benchmark(
+        "INT8 TorchAO",
+        lambda: model_int8(x),
+        OPS
+    )
+
+except Exception as e:
+
+    print("INT8 FAILED:")
+    print(e)
+
+
+# ============================================================
+# INT4
+# ============================================================
+
+try:
+
+    print("\nCreating INT4 model...")
+
+    model_int4 = torch.nn.Linear(
+        K,
+        N,
+        bias=False,
+        device=device,
+        dtype=torch.bfloat16
+    )
+
+    quantize_(
+        model_int4,
+        Int4WeightOnlyConfig(
+            group_size=128
         )
+    )
 
-        B = torch.randint(
-            -128, 127,
-            (N, N),
-            device=DEVICE,
-            dtype=torch.int8
-        )
+    x = torch.randn(
+        M,
+        K,
+        device=device,
+        dtype=torch.bfloat16
+    )
 
-        # PyTorch does not provide the same optimized INT8
-        # Tensor Core path through normal torch.matmul on
-        # every version.
-        #
-        # Therefore this test is mainly a compatibility test.
+    benchmark(
+        "INT4 TorchAO",
+        lambda: model_int4(x),
+        OPS
+    )
 
-        for _ in range(WARMUP):
-            C = torch.matmul(A, B)
+except Exception as e:
 
-        torch.cuda.synchronize()
+    print("INT4 FAILED:")
+    print(e)
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-
-        for _ in range(ITERATIONS):
-            C = torch.matmul(A, B)
-
-        end.record()
-        torch.cuda.synchronize()
-
-        total_ms = start.elapsed_time(end)
-        avg_ms = total_ms / ITERATIONS
-
-        operations = 2 * (N ** 3)
-        tops = operations / (avg_ms / 1000) / 1e12
-
-        print(f"Average time : {avg_ms:.4f} ms")
-        print(f"Performance  : {tops:.2f} TOPS")
-
-        return tops
-
-    except Exception as e:
-        print(f"INT8 unavailable through this PyTorch path: {e}")
-        return None
-
-
-# ============================================================
-# FP8 benchmark
-# ============================================================
-
-def benchmark_fp8():
-
-    print("\nFP8")
-
-    try:
-        # PyTorch FP8 datatype
-        fp8_dtype = torch.float8_e4m3fn
-
-        A = torch.randn(
-            (N, N),
-            device=DEVICE,
-            dtype=torch.float32
-        ).to(fp8_dtype)
-
-        B = torch.randn(
-            (N, N),
-            device=DEVICE,
-            dtype=torch.float32
-        ).to(fp8_dtype)
-
-        # FP8 matmul support varies by PyTorch/CUDA version.
-        for _ in range(WARMUP):
-            C = torch.matmul(A, B)
-
-        torch.cuda.synchronize()
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-
-        for _ in range(ITERATIONS):
-            C = torch.matmul(A, B)
-
-        end.record()
-        torch.cuda.synchronize()
-
-        total_ms = start.elapsed_time(end)
-        avg_ms = total_ms / ITERATIONS
-
-        operations = 2 * (N ** 3)
-        tops = operations / (avg_ms / 1000) / 1e12
-
-        print(f"Average time : {avg_ms:.4f} ms")
-        print(f"Performance  : {tops:.2f} TOPS")
-
-        return tops
-
-    except Exception as e:
-        print(f"FP8 unavailable through torch.matmul: {e}")
-        return None
-
-
-# ============================================================
-# INT4 benchmark
-# ============================================================
-
-def benchmark_int4():
-
-    print("\nINT4")
-
-    print("""
-INT4 does not have a normal torch.matmul(INT4) path that
-directly exposes the L40 Tensor Core INT4 throughput.
-
-For a real INT4 Tensor Core benchmark, use:
-    - CUTLASS
-    - cuBLASLt
-    - TensorRT
-    - Transformer Engine
-
-Skipping generic PyTorch INT4 test.
-""")
-
-    return None
-
-
-# ============================================================
-# Run benchmarks
-# ============================================================
-
-results = {}
-
-results["FP64"] = benchmark_gemm("FP64", "fp64")
-results["FP32"] = benchmark_gemm("FP32", "fp32")
-results["FP16"] = benchmark_gemm("FP16", "fp16")
-results["BF16"] = benchmark_gemm("BF16", "bf16")
-
-results["FP8"] = benchmark_fp8()
-results["INT8"] = benchmark_int8()
-results["INT4"] = benchmark_int4()
-
-
-# ============================================================
-# Results
-# ============================================================
 
 print("\n")
-print("=" * 70)
-print("RESULTS")
-print("=" * 70)
-
-print(f"{'Datatype':<12} {'Performance':>18}")
-print("-" * 70)
-
-for dtype, value in results.items():
-
-    if value is None:
-        print(f"{dtype:<12} {'N/A':>18}")
-    else:
-        unit = "TFLOPS" if dtype.startswith("FP") or dtype == "BF16" else "TOPS"
-        print(f"{dtype:<12} {value:>12.2f} {unit}")
-
-print("=" * 70)
-
-print("""
-Notes:
-- FP64/FP32/FP16/BF16 are GEMM benchmarks.
-- FP8/INT8/INT4 require specialized kernels for meaningful
-  Tensor Core throughput measurements.
-- Increase N to 8192 or 16384 for a more stable GPU benchmark.
-- Run several times and compare the results.
-""")
+print("=" * 75)
+print("DONE")
+print("=" * 75)
