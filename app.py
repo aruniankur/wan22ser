@@ -23,6 +23,11 @@ from PIL import Image
 if os.environ.get("CUDNN_ATTN", "1") == "1" and torch.cuda.is_available():
     os.environ["DIFFUSERS_ATTN_BACKEND"] = "_native_cudnn"
     print("[DEBUG] attention backend -> _native_cudnn (cuDNN SDPA)", flush=True)
+    
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 
 import gradio as gr
 from diffusers import (
