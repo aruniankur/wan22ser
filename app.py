@@ -27,7 +27,7 @@ from diffusers import (
 from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
 from diffusers.utils.export_utils import export_to_video
 
-from torchao.quantization import quantize_, Int8WeightOnlyConfig
+from torchao.quantization import quantize_, Int8WeightOnlyConfig, Float8DynamicActivationFloat8WeightConfig
 import lora_loader
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -304,13 +304,16 @@ quantize_(pipe.text_encoder, Int8WeightOnlyConfig())
 torch._dynamo.reset()
 dbg("text_encoder quantized (int8)", t1)
 
+
+fp8_config = Float8DynamicActivationFloat8WeightConfig()
+
 t1 = time.time()
-quantize_(pipe.transformer, Int8WeightOnlyConfig())
+quantize_(pipe.transformer, fp8_config)
 torch._dynamo.reset()
 dbg("transformer quantized (int8)", t1)
 
 t1 = time.time()
-quantize_(pipe.transformer_2, Int8WeightOnlyConfig())
+quantize_(pipe.transformer_2, fp8_config)
 torch._dynamo.reset()
 dbg("transformer_2 quantized (int8)", t1)
 
