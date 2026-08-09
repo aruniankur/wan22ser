@@ -15,6 +15,15 @@ import torch._dynamo
 from torch.nn import functional as F
 from PIL import Image
 
+# --- CUDNN ATTENTION BACKEND (must be set BEFORE diffusers is imported) ---
+# diffusers 0.39 routes Wan attention through dispatch_attention_fn and reads
+# DIFFUSERS_ATTN_BACKEND at import time. `_native_cudnn` wraps SDPA in
+# sdpa_kernel(CUDNN_ATTENTION) -> ~74 TFLOPS vs ~49 mem_eff on the L40.
+# Disable with CUDNN_ATTN=0 to revert to default dispatch.
+if os.environ.get("CUDNN_ATTN", "1") == "1" and torch.cuda.is_available():
+    os.environ["DIFFUSERS_ATTN_BACKEND"] = "_native_cudnn"
+    print("[DEBUG] attention backend -> _native_cudnn (cuDNN SDPA)", flush=True)
+
 import gradio as gr
 from diffusers import (
     FlowMatchEulerDiscreteScheduler,
@@ -516,6 +525,13 @@ pipe = WanImageToVideoPipeline.from_pretrained(
 )
 dbg("pipeline loaded", t0)
 
+try:
+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+    _ab_name, _ab_fn = _AttentionBackendRegistry.get_active_backend()
+    print(f"[DEBUG] active diffusers attention backend = {_ab_name}", flush=True)
+except Exception as _ab_err:
+    print(f"[DEBUG] could not read attention backend: {_ab_err}", flush=True)
+
 for name in ["text_encoder", "transformer", "transformer_2", "vae"]:
     comp = getattr(pipe, name, None)
     if comp is not None:
@@ -727,6 +743,36 @@ def run_inference(
             callback_on_step_end=pipe_cb,
             output_type="np"
         )
+    except RuntimeError as e:
+        if "cudnn" in str(e).lower() or "no available kernel" in str(e).lower():
+            print(f"[DEBUG] cuDNN attention failed, retrying once with native backend: {e}", flush=True)
+            from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+            _AttentionBackendRegistry.set_active_backend("native")
+            torch._dynamo.reset()
+            if lora_loaded:
+                lora_loader.unload_lora(pipe)
+            pipe.scheduler = original_scheduler
+            clear_vram()
+            t_pipe = time.time()
+            pipe_cb = _make_step_cb(int(steps), t_pipe)
+            result = pipe(
+                image=resized_image,
+                last_image=processed_last_image,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=resized_image.height,
+                width=resized_image.width,
+                num_frames=num_frames,
+                guidance_scale=float(guidance_scale),
+                guidance_scale_2=float(guidance_scale_2),
+                num_inference_steps=int(steps),
+                generator=torch.Generator(device="cuda").manual_seed(current_seed),
+                callback_on_step_end=pipe_cb,
+                output_type="np"
+            )
+            print("[DEBUG] retry with native backend succeeded", flush=True)
+        else:
+            raise
     except torch.cuda.OutOfMemoryError as e:
         print(f"CUDA OOM: {e}")
         dbg("OOM caught - GPU state before cleanup")
