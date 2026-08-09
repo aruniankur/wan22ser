@@ -628,17 +628,34 @@ def clamp_dim(value: int) -> int:
     return max(MIN_DIM, min(MAX_DIM, value))
 
 
-def on_image_upload(image, user_override):
+def compute_tokens_text(width: int, height: int, duration_seconds: float) -> str:
+    num_frames = get_num_frames(duration_seconds)
+    latent_frames = (num_frames - 1) // 4 + 1
+    lw, lh = width // 8, height // 8
+    tokens = latent_frames * lw * lh
+    if tokens >= 1_000_000:
+        tokens_str = f"{tokens / 1e6:.1f}M"
+    elif tokens >= 1_000:
+        tokens_str = f"{tokens / 1e3:.0f}K"
+    else:
+        tokens_str = str(tokens)
+    return (
+        f"**Estimated tokens:** {tokens_str} ({tokens:,}) "
+        f"= {latent_frames} latent frames × {lw} × {lh}"
+    )
+
+
+def on_image_upload(image, user_override, duration_seconds):
     if image is None:
-        return gr.update(), gr.update(), "", user_override
+        return gr.update(), gr.update(), "", user_override, ""
     width, height = image.size
     auto_w, auto_h = clamp_dim(width), clamp_dim(height)
     size_text = f"**Image size:** {width} × {height} px"
     if (auto_w, auto_h) != (width, height):
         size_text += f"  →  Output: {auto_w} × {auto_h} px"
     if user_override:
-        return gr.update(), gr.update(), size_text, user_override
-    return auto_w, auto_h, size_text, False
+        return gr.update(), gr.update(), size_text, user_override, compute_tokens_text(auto_w, auto_h, duration_seconds)
+    return auto_w, auto_h, size_text, False, compute_tokens_text(auto_w, auto_h, duration_seconds)
 
 
 def mark_user_override():
@@ -924,6 +941,7 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
                 with gr.Row():
                     width_input = gr.Slider(minimum=MIN_DIM, maximum=MAX_DIM, step=MULTIPLE_OF, value=DEFAULT_WIDTH, label="Output Width (px)", info="Steps of 16. Image is cover-cropped to fit.")
                     height_input = gr.Slider(minimum=MIN_DIM, maximum=MAX_DIM, step=MULTIPLE_OF, value=DEFAULT_HEIGHT, label="Output Height (px)", info="Higher values use much more VRAM/time — lower if you hit OOM.")
+                tokens_info = gr.Markdown(compute_tokens_text(DEFAULT_WIDTH, DEFAULT_HEIGHT, 3.5))
                 lora_dropdown = gr.Dropdown(choices=lora_loader.get_lora_choices(), label="LoRA (NSFW)", multiselect=True, info="Select scenario LoRAs")
                 play_result_video = gr.Checkbox(label="Display result", value=True, interactive=True)
 
@@ -960,11 +978,17 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
 
     input_image_component.change(
         fn=on_image_upload,
-        inputs=[input_image_component, user_override_state],
-        outputs=[width_input, height_input, image_size_info, user_override_state],
+        inputs=[input_image_component, user_override_state, duration_seconds_input],
+        outputs=[width_input, height_input, image_size_info, user_override_state, tokens_info],
     )
     width_input.change(fn=mark_user_override, outputs=[user_override_state])
     height_input.change(fn=mark_user_override, outputs=[user_override_state])
+    for dim_input in [width_input, height_input, duration_seconds_input]:
+        dim_input.change(
+            fn=compute_tokens_text,
+            inputs=[width_input, height_input, duration_seconds_input],
+            outputs=[tokens_info],
+        )
     
     # --- Frame Grabbing Events ---
     # 1. Click button -> JS runs -> puts time in hidden number box
