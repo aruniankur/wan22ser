@@ -40,6 +40,19 @@ from diffusers.utils.export_utils import export_to_video
 from torchao.quantization import quantize_, Int8WeightOnlyConfig, Float8DynamicActivationFloat8WeightConfig
 import lora_loader
 
+# Compatibility shim: dev versions of diffusers define TorchaoLoraLinear with a
+# required 'get_apply_tensor_subclass' kwarg that older torchao releases lack.
+try:
+    from diffusers.models.lora import TorchaoLoraLinear
+    _orig_init = TorchaoLoraLinear.__init__
+    def _patched_init(self, *args, **kwargs):
+        kwargs.setdefault('get_apply_tensor_subclass', None)
+        return _orig_init(self, *args, **kwargs)
+    TorchaoLoraLinear.__init__ = _patched_init
+    print("[DEBUG] Applied TorchaoLoraLinear compatibility shim", flush=True)
+except ImportError:
+    pass
+
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 warnings.filterwarnings("ignore")
 
