@@ -697,7 +697,7 @@ def mark_user_override():
 
 
 def pad_to_square(image: Image.Image, fill=(0, 0, 0)) -> Image.Image:
-    """Pad the image with black borders to make it square, preserving content."""
+    """Pad the image with borders to make it square, preserving content."""
     width, height = image.size
     side = max(width, height)
     if width == height:
@@ -707,13 +707,18 @@ def pad_to_square(image: Image.Image, fill=(0, 0, 0)) -> Image.Image:
     return padded
 
 
-def on_square(image, duration_seconds):
+def hex_to_rgb(hex_color: str):
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def on_square(image, duration_seconds, padding_color):
     if image is None:
-        return gr.update(), gr.update(), gr.update(), duration_seconds, False, ""
-    square_image = pad_to_square(image)
+        return gr.update(), gr.update(), gr.update(), gr.update(), False, ""
+    square_image = pad_to_square(image, fill=hex_to_rgb(padding_color))
     side = clamp_dim(square_image.size[0])
     size_text = f"**Image size:** {square_image.size[0]} × {square_image.size[1]} px  →  Output: {side} × {side} px"
-    return square_image, side, side, 10.0, False, compute_tokens_text(side, side, 10.0)
+    return square_image, side, side, gr.update(value=10.0), False, compute_tokens_text(side, side, 10.0)
 
 
 def run_inference(
@@ -993,7 +998,9 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
     with gr.Row():
         with gr.Column():
             input_image_component = gr.Image(type="pil", label="Input Image", sources=["upload", "clipboard"])
-            square_button = gr.Button("🔲 Auto Square", variant="secondary")
+            with gr.Row():
+                square_button = gr.Button("🔲 Auto Square", variant="secondary")
+                padding_color_picker = gr.ColorPicker(label="Padding Color", value="#000000")
             image_size_info = gr.Markdown("")
             user_override_state = gr.State(False)
             prompt_input = gr.Textbox(label="Prompt", value=default_prompt_i2v)
@@ -1070,7 +1077,7 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
     )
     square_button.click(
         fn=on_square,
-        inputs=[input_image_component, duration_seconds_input],
+        inputs=[input_image_component, duration_seconds_input, padding_color_picker],
         outputs=[input_image_component, width_input, height_input, duration_seconds_input, user_override_state, image_size_info],
     )
     width_input.change(fn=mark_user_override, outputs=[user_override_state])
