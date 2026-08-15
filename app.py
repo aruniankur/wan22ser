@@ -696,6 +696,26 @@ def mark_user_override():
     return True
 
 
+def pad_to_square(image: Image.Image, fill=(0, 0, 0)) -> Image.Image:
+    """Pad the image with black borders to make it square, preserving content."""
+    width, height = image.size
+    side = max(width, height)
+    if width == height:
+        return image
+    padded = Image.new(image.mode, (side, side), fill)
+    padded.paste(image, ((side - width) // 2, (side - height) // 2))
+    return padded
+
+
+def on_square(image, duration_seconds):
+    if image is None:
+        return gr.update(), gr.update(), gr.update(), duration_seconds, False, ""
+    square_image = pad_to_square(image)
+    side = clamp_dim(square_image.size[0])
+    size_text = f"**Image size:** {square_image.size[0]} × {square_image.size[1]} px  →  Output: {side} × {side} px"
+    return square_image, side, side, 10.0, False, compute_tokens_text(side, side, 10.0)
+
+
 def run_inference(
     resized_image,
     processed_last_image,
@@ -973,6 +993,7 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
     with gr.Row():
         with gr.Column():
             input_image_component = gr.Image(type="pil", label="Input Image", sources=["upload", "clipboard"])
+            square_button = gr.Button("🔲 Auto Square", variant="secondary")
             image_size_info = gr.Markdown("")
             user_override_state = gr.State(False)
             prompt_input = gr.Textbox(label="Prompt", value=default_prompt_i2v)
@@ -1046,6 +1067,11 @@ with gr.Blocks(delete_cache=(3600, 10800)) as demo:
         fn=on_image_upload,
         inputs=[input_image_component, user_override_state, duration_seconds_input],
         outputs=[width_input, height_input, image_size_info, user_override_state, tokens_info],
+    )
+    square_button.click(
+        fn=on_square,
+        inputs=[input_image_component, duration_seconds_input],
+        outputs=[input_image_component, width_input, height_input, duration_seconds_input, user_override_state, image_size_info],
     )
     width_input.change(fn=mark_user_override, outputs=[user_override_state])
     height_input.change(fn=mark_user_override, outputs=[user_override_state])
